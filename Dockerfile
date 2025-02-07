@@ -67,7 +67,7 @@ VOLUME /data
 
 # 复制 FastAPI 代码
 WORKDIR /app
-COPY main.py /app/main.py
+COPY app.py /app/app.py
 
 # 启动 FastAPI 服务
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
