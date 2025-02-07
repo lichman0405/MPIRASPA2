@@ -1,5 +1,5 @@
-# 使用 Ubuntu 20.04 作为基础镜像
-FROM ubuntu:20.04
+# 使用 Ubuntu 24.04 作为基础镜像
+FROM ubuntu:24.04
 
 # 设置非交互模式，避免 `apt-get` 交互式提示
 ENV DEBIAN_FRONTEND=noninteractive
