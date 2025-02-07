@@ -20,7 +20,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     automake \
     autoconf \
     libtool \
-    mpich \
     && rm -rf /var/lib/apt/lists/*
 
 # 创建 Python 虚拟环境
@@ -31,8 +30,19 @@ ENV PATH="/opt/venv/bin:$PATH"
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-# 设置工作目录
-WORKDIR /opt
+# 编译 MPICH 4.3.0
+WORKDIR /tmp
+RUN wget https://www.mpich.org/static/downloads/4.3.0/mpich-4.3.0.tar.gz && \
+    tar -xvf mpich-4.3.0.tar.gz && \
+    cd mpich-4.3.0 && \
+    ./configure --prefix=/usr/local/mpich --disable-fortran && \
+    make -j "$(nproc)" && \
+    make install && \
+    cd /tmp && rm -rf mpich-4.3.0 mpich-4.3.0.tar.gz
+
+# 设置环境变量
+ENV PATH="/usr/local/mpich/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/usr/local/mpich/lib:${LD_LIBRARY_PATH:-}"
 
 # 克隆 RASPA2 并编译
 RUN git clone https://github.com/iRASPA/RASPA2.git /opt/RASPA2
@@ -48,10 +58,9 @@ RUN rm -rf autom4te.cache \
     && make -j "$(nproc)" \
     && make install
 
-# 设置环境变量
+# 设置 RASPA 环境变量
 ENV RASPA_DIR="/usr/local/raspa"
 ENV PATH="${RASPA_DIR}/bin:${PATH}"
-ENV LD_LIBRARY_PATH="/usr/local/mpich/lib:${LD_LIBRARY_PATH:-}"
 
 # 声明数据挂载目录
 VOLUME /data
