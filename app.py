@@ -5,11 +5,53 @@ from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import FileResponse, JSONResponse
 from typing import Optional
 import subprocess
+import threading
 import zipfile
 
 app = FastAPI()
 
-BASE_WORK_DIR = "/data"  # Working directory inside the container, mounted to the host
+# Base directory where all simulation tasks will be stored
+BASE_WORK_DIR = "/data"
+
+# Dictionary to store task statuses
+task_status = {}
+
+def run_simulation_task(task_id: str, work_dir_path: str, nproc: int):
+    """
+    Runs a RASPA2 simulation task in the specified working directory.
+
+    Parameters:
+        task_id (str): Unique identifier for the simulation task.
+        work_dir_path (str): Path to the directory where simulation files are stored.
+        nproc (int): Number of processes to use for the simulation.
+
+    This function executes the RASPA2 `simulate` command using `mpiexec` in a separate thread.
+    It updates the `task_status` dictionary to track the simulation progress.
+    """
+    log_file_path = os.path.join(work_dir_path, "simulation.log")
+    output_dir = os.path.join(work_dir_path, "Output", "System_0")
+
+    # Update task status to "running"
+    task_status[task_id] = {"status": "running", "log": []}
+
+    # Construct the simulation command
+    command = [
+        "mpiexec",
+        "-n", str(nproc),
+        "simulate",
+        "-i", "simulation.input"
+    ]
+
+    # Execute the simulation and capture the output log
+    with open(log_file_path, "w") as log_file:
+        process = subprocess.Popen(command, cwd=work_dir_path, stdout=log_file, stderr=subprocess.STDOUT)
+        process.wait()  # Wait for RASPA2 to finish execution
+
+    # Check if the simulation completed successfully
+    if os.path.exists(output_dir):
+        task_status[task_id]["status"] = "completed"
+    else:
+        task_status[task_id]["status"] = "failed"
 
 @app.post("/run_simulation")
 async def run_simulation(
@@ -21,26 +63,26 @@ async def run_simulation(
     nproc: Optional[int] = Form(2)
 ):
     """
-    Upload 5 files, execute RASPA2 simulation, and return all files in ./Output/System_0 (packaged as a zip)
+    Uploads simulation files, starts an asynchronous RASPA2 simulation, and returns a task ID.
+
+    Parameters:
+        force_field_mixing_rules (UploadFile): Force field mixing rules definition file.
+        pseudo_atoms (UploadFile): Pseudo atoms definition file.
+        mof_cif (UploadFile): CIF file containing the MOF structure.
+        adsorbate_def (UploadFile): Definition file for the adsorbate molecule (e.g., CO2.def).
+        simulation_input (UploadFile): RASPA2 input file.
+        nproc (int, optional): Number of processes to use for the simulation (default is 2).
+
+    Returns:
+        JSONResponse: Contains task ID and initial status message.
     """
-
-    # Validate number of processes
-    if nproc <= 0:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "error",
-                "message": "Invalid number of processes. Must be greater than 0."
-            }
-        )
-
-    # 1. Create working directory
+    # Generate a unique task ID based on the current timestamp
     now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    work_dir_name = f"work_{now_str}"
-    work_dir_path = os.path.join(BASE_WORK_DIR, work_dir_name)
+    task_id = f"task_{now_str}"
+    work_dir_path = os.path.join(BASE_WORK_DIR, task_id)
     os.makedirs(work_dir_path, exist_ok=True)
 
-    # 2. Save uploaded files
+    # Dictionary to map filenames to uploaded files
     uploaded_files = {
         "force_field_mixing_rules.def": force_field_mixing_rules,
         "pseudo_atoms.def": pseudo_atoms,
@@ -49,110 +91,84 @@ async def run_simulation(
         "simulation.input": simulation_input
     }
 
+    # Save uploaded files to the working directory
     for fname, up_file in uploaded_files.items():
-        try:
-            dst_path = os.path.join(work_dir_path, fname)
-            with open(dst_path, "wb") as f:
-                shutil.copyfileobj(up_file.file, f)
-            up_file.file.close()  # Ensure the uploaded file is properly closed
-        except Exception as e:
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "status": "error",
-                    "message": f"Failed to save uploaded file {fname}.",
-                    "detail": str(e)
-                }
-            )
+        dst_path = os.path.join(work_dir_path, fname)
+        with open(dst_path, "wb") as f:
+            shutil.copyfileobj(up_file.file, f)
+        up_file.file.close()
 
-    # 3. Log file name
-    log_file_name = f"log_{now_str}.txt"
-    log_file_path = os.path.join(work_dir_path, log_file_name)
+    # Start the simulation in a separate thread
+    thread = threading.Thread(target=run_simulation_task, args=(task_id, work_dir_path, nproc))
+    thread.start()
 
-    # 4. Construct mpiexec command
-    command = [
-        "mpiexec",
-        "-n", str(nproc),
-        "simulate",
-        "-i", "simulation.input"
-    ]
+    # Initialize task status
+    task_status[task_id] = {"status": "queued"}
 
-    # 5. Execute RASPA2 simulation and log output
-    try:
-        result = subprocess.run(
-            command,
-            cwd=work_dir_path,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=True
-        )
-        # Write log
-        with open(log_file_path, "w") as f:
-            f.write(result.stdout)
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status": "queued",
+            "message": "Simulation started.",
+            "task_id": task_id
+        }
+    )
 
-    except subprocess.CalledProcessError as e:
-        # On failure, write error message to log
-        with open(log_file_path, "w") as f:
-            f.write(e.stdout if e.stdout else str(e))
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "error",
-                "message": "Simulation failed. Check log file.",
-                "log_file": log_file_path
-            }
-        )
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "message": "An unexpected error occurred during simulation.",
-                "detail": str(e)
-            }
-        )
+@app.get("/task_status/{task_id}")
+async def get_status(task_id: str):
+    """
+    Retrieves the status of a specific simulation task.
 
-    # 6. If successful, package all files in "Output/System_0"
-    system_0_path = os.path.join(work_dir_path, "Output", "System_0")
-    if not os.path.exists(system_0_path):
-        # If System_0 directory is not found unexpectedly, return an error
-        return JSONResponse(
-            status_code=404,
-            content={
-                "status": "error",
-                "message": f"No System_0 folder found in {system_0_path}. Check the simulation results or inputs. Or, to be specific, check the log file.",
-            }
-        )
+    Parameters:
+        task_id (str): The unique identifier for the task.
 
-    # Create a zip file (e.g., result_20230207_123456.zip) in the work_dir_path
-    zip_filename = f"results_{now_str}.zip"
+    Returns:
+        JSONResponse: Contains task status and recent log output (if available).
+    """
+    if task_id not in task_status:
+        return JSONResponse(status_code=404, content={"status": "error", "message": "Task not found."})
+
+    # Retrieve the latest log output (last 10 lines)
+    log_file_path = os.path.join(BASE_WORK_DIR, task_id, "simulation.log")
+    if os.path.exists(log_file_path):
+        with open(log_file_path, "r") as f:
+            log_content = f.readlines()[-10:]
+
+        task_status[task_id]["log"] = log_content
+
+    return JSONResponse(status_code=200, content=task_status[task_id])
+
+@app.get("/download_results/{task_id}")
+async def download_results(task_id: str):
+    """
+    Downloads the simulation results as a ZIP file.
+
+    Parameters:
+        task_id (str): The unique identifier for the task.
+
+    Returns:
+        FileResponse: The ZIP file containing simulation results if available.
+        JSONResponse: Error message if results are not found.
+    """
+    work_dir_path = os.path.join(BASE_WORK_DIR, task_id)
+    output_dir = os.path.join(work_dir_path, "Output", "System_0")
+
+    if not os.path.exists(output_dir):
+        return JSONResponse(status_code=404, content={"status": "error", "message": "No results found."})
+
+    # Create a ZIP archive of the simulation results
+    zip_filename = f"results_{task_id}.zip"
     zip_filepath = os.path.join(work_dir_path, zip_filename)
 
-    # Package System_0 directory
     try:
         with zipfile.ZipFile(zip_filepath, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
-            for root, dirs, files in os.walk(system_0_path):
+            for root, _, files in os.walk(output_dir):
                 for file in files:
                     abs_file_path = os.path.join(root, file)
-                    # Use relative paths in the zip file
-                    rel_path = os.path.relpath(abs_file_path, start=system_0_path)
+                    rel_path = os.path.relpath(abs_file_path, start=output_dir)
                     zipf.write(abs_file_path, arcname=rel_path)
     except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "message": "Failed to create zip file.",
-                "detail": str(e)
-            }
-        )
+        return JSONResponse(status_code=500, content={"status": "error", "message": "Failed to create zip file.", "detail": str(e)})
 
-    # 7. Return the zip file to the client
-    #    Using FileResponse directly will automatically handle Content-Type headers, etc.
-    return FileResponse(
-        path=zip_filepath,
-        media_type="application/zip",
-        filename=zip_filename,
-        status_code=200
-    )
+    return FileResponse(path=zip_filepath, media_type="application/zip", filename=zip_filename)
+
