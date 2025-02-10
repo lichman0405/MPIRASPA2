@@ -121,7 +121,7 @@ async def run_simulation(
             status_code=404,
             content={
                 "status": "error",
-                "message": f"No System_0 folder found in {system_0_path}. Check the simulation results or inputs."
+                "message": f"No System_0 folder found in {system_0_path}. Check the simulation results or inputs. Or, to be specific, check the log file.",
             }
         )
 
