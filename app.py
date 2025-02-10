@@ -9,7 +9,7 @@ import zipfile
 
 app = FastAPI()
 
-BASE_WORK_DIR = "/data"  # 容器内工作目录，挂载到宿主机
+BASE_WORK_DIR = "/data"  # Working directory inside the container, mounted to the host
 
 @app.post("/run_simulation")
 async def run_simulation(
@@ -21,16 +21,26 @@ async def run_simulation(
     nproc: Optional[int] = Form(2)
 ):
     """
-    上传 5 个文件，执行 RASPA2 模拟，然后返回 ./Output/System_0 下的所有文件（打包为zip）
+    Upload 5 files, execute RASPA2 simulation, and return all files in ./Output/System_0 (packaged as a zip)
     """
 
-    # 1. 创建工作目录
+    # Validate number of processes
+    if nproc <= 0:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "message": "Invalid number of processes. Must be greater than 0."
+            }
+        )
+
+    # 1. Create working directory
     now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     work_dir_name = f"work_{now_str}"
     work_dir_path = os.path.join(BASE_WORK_DIR, work_dir_name)
     os.makedirs(work_dir_path, exist_ok=True)
 
-    # 2. 保存上传文件
+    # 2. Save uploaded files
     uploaded_files = {
         "force_field_mixing_rules.def": force_field_mixing_rules,
         "pseudo_atoms.def": pseudo_atoms,
@@ -40,15 +50,26 @@ async def run_simulation(
     }
 
     for fname, up_file in uploaded_files.items():
-        dst_path = os.path.join(work_dir_path, fname)
-        with open(dst_path, "wb") as f:
-            shutil.copyfileobj(up_file.file, f)
+        try:
+            dst_path = os.path.join(work_dir_path, fname)
+            with open(dst_path, "wb") as f:
+                shutil.copyfileobj(up_file.file, f)
+            up_file.file.close()  # Ensure the uploaded file is properly closed
+        except Exception as e:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "status": "error",
+                    "message": f"Failed to save uploaded file {fname}.",
+                    "detail": str(e)
+                }
+            )
 
-    # 3. 日志文件名
+    # 3. Log file name
     log_file_name = f"log_{now_str}.txt"
     log_file_path = os.path.join(work_dir_path, log_file_name)
 
-    # 4. 构造 mpiexec 命令
+    # 4. Construct mpiexec command
     command = [
         "mpiexec",
         "-n", str(nproc),
@@ -56,7 +77,7 @@ async def run_simulation(
         "-i", "simulation.input"
     ]
 
-    # 5. 执行 RASPA2 模拟并记录日志
+    # 5. Execute RASPA2 simulation and log output
     try:
         result = subprocess.run(
             command,
@@ -66,14 +87,14 @@ async def run_simulation(
             text=True,
             check=True
         )
-        # 写入日志
+        # Write log
         with open(log_file_path, "w") as f:
             f.write(result.stdout)
 
     except subprocess.CalledProcessError as e:
-        # 失败则把错误信息写入日志
+        # On failure, write error message to log
         with open(log_file_path, "w") as f:
-            f.write(e.output if e.output else str(e))
+            f.write(e.stdout if e.stdout else str(e))
         return JSONResponse(
             status_code=400,
             content={
@@ -82,11 +103,20 @@ async def run_simulation(
                 "log_file": log_file_path
             }
         )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": "An unexpected error occurred during simulation.",
+                "detail": str(e)
+            }
+        )
 
-    # 6. 如果执行成功，则需要打包 "Output/System_0" 下的所有文件
+    # 6. If successful, package all files in "Output/System_0"
     system_0_path = os.path.join(work_dir_path, "Output", "System_0")
     if not os.path.exists(system_0_path):
-        # 如果意外地没有生成System_0目录，就返回提示
+        # If System_0 directory is not found unexpectedly, return an error
         return JSONResponse(
             status_code=404,
             content={
@@ -95,23 +125,34 @@ async def run_simulation(
             }
         )
 
-    # 创建zip包 (如: result_20230207_123456.zip)，存储在 work_dir_path 下
+    # Create a zip file (e.g., result_20230207_123456.zip) in the work_dir_path
     zip_filename = f"results_{now_str}.zip"
     zip_filepath = os.path.join(work_dir_path, zip_filename)
 
-    # 打包 System_0 目录
-    with zipfile.ZipFile(zip_filepath, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
-        for root, dirs, files in os.walk(system_0_path):
-            for file in files:
-                abs_file_path = os.path.join(root, file)
-                # 在zip中使用相对路径
-                rel_path = os.path.relpath(abs_file_path, start=system_0_path)
-                zipf.write(abs_file_path, arcname=rel_path)
+    # Package System_0 directory
+    try:
+        with zipfile.ZipFile(zip_filepath, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(system_0_path):
+                for file in files:
+                    abs_file_path = os.path.join(root, file)
+                    # Use relative paths in the zip file
+                    rel_path = os.path.relpath(abs_file_path, start=system_0_path)
+                    zipf.write(abs_file_path, arcname=rel_path)
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": "Failed to create zip file.",
+                "detail": str(e)
+            }
+        )
 
-    # 7. 返回 zip 文件给请求端
-    #    使用FileResponse直接返回，会自动处理Content-Type等头部
+    # 7. Return the zip file to the client
+    #    Using FileResponse directly will automatically handle Content-Type headers, etc.
     return FileResponse(
         path=zip_filepath,
         media_type="application/zip",
-        filename=zip_filename
+        filename=zip_filename,
+        status_code=200
     )
